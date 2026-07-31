@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Касса · Учёт табачной лавки</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ЭКРАН ВХОДА -->
+<div id="loginScreen" class="login-screen">
+  <div class="login-card">
+    <div class="login-mark">✦</div>
+    <h1>Касса</h1>
+    <p class="login-sub">Учёт табачной лавки</p>
+    <form id="loginForm">
+      <input type="email" id="loginEmail" placeholder="Почта" autocomplete="username" required>
+      <input type="password" id="loginPassword" placeholder="Пароль" autocomplete="current-password" required>
+      <button type="submit" class="btn btn-primary btn-block">Войти</button>
+    </form>
+    <p id="loginError" class="error-text"></p>
+  </div>
+</div>
+
+<!-- ПРИЛОЖЕНИЕ -->
+<div id="app" class="app hidden">
+
+  <header class="topbar">
+    <div class="topbar-title">
+      <span class="topbar-eyebrow" id="topDate">—</span>
+      <h1 id="topStatus">Касса</h1>
+    </div>
+    <button id="logoutBtn" class="icon-btn" title="Выйти">⏻</button>
+  </header>
+
+  <main id="views" class="views">
+
+    <!-- СЕГОДНЯ -->
+    <section id="view-today" class="view">
+      <div id="todayContent"><div class="loader">Загрузка…</div></div>
+    </section>
+
+    <!-- АССОРТИМЕНТ -->
+    <section id="view-products" class="view hidden">
+      <div class="view-header">
+        <h2>Ассортимент</h2>
+        <button id="addProductBtn" class="btn btn-accent btn-sm">+ Товар</button>
+      </div>
+      <div id="productsList" class="list"></div>
+    </section>
+
+    <!-- АРХИВ -->
+    <section id="view-archive" class="view hidden">
+      <div class="view-header">
+        <h2>Архив по дням</h2>
+      </div>
+      <div id="archiveList" class="list"></div>
+      <div id="archiveDetail" class="hidden"></div>
+    </section>
+
+  </main>
+
+  <nav class="tabbar">
+    <button class="tab active" data-view="today"><span>Сегодня</span></button>
+    <button class="tab" data-view="products"><span>Ассортимент</span></button>
+    <button class="tab" data-view="archive"><span>Архив</span></button>
+  </nav>
+
+</div>
+
+<!-- Модальное окно (товар / закупка) -->
+<div id="modalOverlay" class="modal-overlay hidden">
+  <div class="modal">
+    <div class="modal-header">
+      <h3 id="modalTitle">—</h3>
+      <button id="modalClose" class="icon-btn">✕</button>
+    </div>
+    <div id="modalBody" class="modal-body"></div>
+  </div>
+</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
+<script src="firebase-config.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
