@@ -162,15 +162,21 @@ function openProductForm(id){
 // СЕГОДНЯ
 // =================================================================
 async function loadToday(){
-  const doc = await db.collection('days').doc(TODAY_ID).get();
-  TODAY_DOC = doc.exists ? doc.data() : null;
-  if(TODAY_DOC && TODAY_DOC.morning && !TODAY_DOC.closed){
-    const psnap = await db.collection('days').doc(TODAY_ID).collection('purchases').orderBy('time','asc').get();
-    PURCHASES = psnap.docs.map(d=>({id:d.id, ...d.data()}));
-  } else {
-    PURCHASES = [];
+  const el = document.getElementById('todayContent');
+  try{
+    const doc = await db.collection('days').doc(TODAY_ID).get();
+    TODAY_DOC = doc.exists ? doc.data() : null;
+    if(TODAY_DOC && TODAY_DOC.morning && !TODAY_DOC.closed){
+      const psnap = await db.collection('days').doc(TODAY_ID).collection('purchases').orderBy('time','asc').get();
+      PURCHASES = psnap.docs.map(d=>({id:d.id, ...d.data()}));
+    } else {
+      PURCHASES = [];
+    }
+    await renderToday();
+  }catch(e){
+    console.error('loadToday error', e);
+    el.innerHTML = `<div class="card">Не удалось загрузить день: ${escapeHtml(e.message||String(e))}</div>`;
   }
-  renderToday();
 }
 
 async function renderToday(){
@@ -242,10 +248,16 @@ function countItemHtml(p, prefix, prefill){
 
 async function suggestMorning(){
   // подтягиваем вечерний остаток предыдущего закрытого дня как основу утреннего
-  const snap = await db.collection('days').where('closed','==',true).orderBy('closedAt','desc').limit(1).get();
-  if(snap.empty) return {};
-  const prev = snap.docs[0].data();
-  return prev.evening || {};
+  // (сортируем на клиенте, чтобы не требовался составной индекс Firestore)
+  try{
+    const snap = await db.collection('days').where('closed','==',true).get();
+    if(snap.empty) return {};
+    const docs = snap.docs.sort((a,b)=> b.id.localeCompare(a.id));
+    return docs[0].data().evening || {};
+  }catch(e){
+    console.error('suggestMorning error', e);
+    return {};
+  }
 }
 
 async function saveMorning(){
@@ -317,7 +329,9 @@ function computeSummary(evening){
     const cost = p.costPrice ? soldClamped * (p.costPrice/p.packSize) : 0;
     totalExpected += revenue;
     totalProfit += (revenue-cost);
-    perProduct[p.id] = { name:p.name, morningSticks, purchasedSticks, eveningSticks, sold, revenue };
+    // цена фиксируется на момент закрытия дня — если позже цену товара изменят,
+    // в архиве всё равно останется та, что была в этот день
+    perProduct[p.id] = { name:p.name, morningSticks, purchasedSticks, eveningSticks, sold, revenue, pricePerStick:p.stickPrice };
   });
   return { perProduct, totalExpected, totalProfit, anomalies };
 }
@@ -358,7 +372,7 @@ function renderReceipt(summary, dayId){
       <div class="r-title">Касса</div>
       <div class="r-date">${dateLabel(dayId)}</div>
       ${Object.values(summary.perProduct).map(pp=>`
-        <div class="r-line"><span class="r-name">${escapeHtml(pp.name)} × ${Math.max(0,pp.sold)}</span><span class="r-num">${money(pp.revenue)}</span></div>
+        <div class="r-line"><span class="r-name">${escapeHtml(pp.name)} × ${Math.max(0,pp.sold)} по ${money(pp.pricePerStick||0)}</span><span class="r-num">${money(pp.revenue)}</span></div>
       `).join('')}
       <hr>
       <div class="r-total"><span>Ожидалось</span><span>${money(summary.totalExpected)}</span></div>
@@ -380,9 +394,18 @@ async function renderArchiveList(){
   const listEl = document.getElementById('archiveList');
   listEl.classList.remove('hidden');
   listEl.innerHTML = `<div class="loader">Загрузка…</div>`;
-  const snap = await db.collection('days').where('closed','==',true).orderBy('closedAt','desc').limit(60).get();
+  let snap;
+  try{
+    // без orderBy на сервере — не требует составного индекса Firestore
+    snap = await db.collection('days').where('closed','==',true).get();
+  }catch(e){
+    console.error('archive load error', e);
+    listEl.innerHTML = `<div class="card">Не удалось загрузить архив: ${escapeHtml(e.message||String(e))}</div>`;
+    return;
+  }
   if(snap.empty){ listEl.innerHTML = `<div class="card">Пока нет закрытых дней.</div>`; return; }
-  listEl.innerHTML = snap.docs.map(d=>{
+  const docs = snap.docs.sort((a,b)=> b.id.localeCompare(a.id)).slice(0,60);
+  listEl.innerHTML = docs.map(d=>{
     const s = d.data().summary;
     const cls = Math.abs(s.diff)<0.01?'ok':(s.diff<0?'bad':'ok');
     const label = Math.abs(s.diff)<0.01?'сходится':(s.diff<0?`−${money(Math.abs(s.diff))}`:`+${money(s.diff)}`);
