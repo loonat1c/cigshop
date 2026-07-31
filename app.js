@@ -3,9 +3,11 @@ const auth = firebase.auth();
 const db = firebase.firestore();
 
 let PRODUCTS = [];          // кэш ассортимента [{id,name,packSize,packPrice,stickPrice,costPrice,archived}]
-let TODAY_ID = dateId(new Date());
-let TODAY_DOC = null;       // текущее состояние дня из Firestore
-let PURCHASES = [];         // закупки текущего дня
+let TODAY_ID = dateId(new Date());  // реальная сегодняшняя дата
+let ACTIVE_DAY = TODAY_ID;          // день, который сейчас показан на экране (может быть архивный)
+let ACTIVE_CONTEXT = 'today';       // 'today' | 'archive'
+let ACTIVE_DOC = null;              // данные ACTIVE_DAY из Firestore
+let PURCHASES = [];                 // закупки ACTIVE_DAY
 
 // ---------- УТИЛИТЫ ----------
 function dateId(d){
@@ -63,6 +65,7 @@ document.querySelectorAll('.tab').forEach(btn=>{
     const view = btn.dataset.view;
     document.querySelectorAll('.view').forEach(v=>v.classList.add('hidden'));
     document.getElementById('view-'+view).classList.remove('hidden');
+    if(view==='today') loadToday();          // сброс на реальный сегодняшний день
     if(view==='products') renderProducts();
     if(view==='archive') renderArchiveList();
   });
@@ -145,7 +148,7 @@ function openProductForm(id){
     await loadProducts();
     renderProducts();
     closeModal();
-    renderToday();
+    loadActiveDay();
   });
   if(p){
     document.getElementById('pf-archive').addEventListener('click', async ()=>{
@@ -159,76 +162,125 @@ function openProductForm(id){
 }
 
 // =================================================================
-// СЕГОДНЯ
+// РАБОЧИЙ ДЕНЬ (общая логика — и для "Сегодня", и для правки архивных дней)
 // =================================================================
+function activeContainer(){
+  return document.getElementById(ACTIVE_CONTEXT==='today' ? 'todayContent' : 'archiveDetail');
+}
+
 async function loadToday(){
-  const el = document.getElementById('todayContent');
+  ACTIVE_DAY = TODAY_ID;
+  ACTIVE_CONTEXT = 'today';
+  await loadActiveDay();
+}
+
+async function loadActiveDay(){
+  const el = activeContainer();
+  el.innerHTML = `<div class="loader">Загрузка…</div>`;
   try{
-    const doc = await db.collection('days').doc(TODAY_ID).get();
-    TODAY_DOC = doc.exists ? doc.data() : null;
-    if(TODAY_DOC && TODAY_DOC.morning && !TODAY_DOC.closed){
-      const psnap = await db.collection('days').doc(TODAY_ID).collection('purchases').orderBy('time','asc').get();
+    const doc = await db.collection('days').doc(ACTIVE_DAY).get();
+    ACTIVE_DOC = doc.exists ? doc.data() : null;
+    if(ACTIVE_DOC && ACTIVE_DOC.morning && !ACTIVE_DOC.closed){
+      const psnap = await db.collection('days').doc(ACTIVE_DAY).collection('purchases').orderBy('time','asc').get();
       PURCHASES = psnap.docs.map(d=>({id:d.id, ...d.data()}));
     } else {
       PURCHASES = [];
     }
-    await renderToday();
+    await renderDayWorkflow();
   }catch(e){
-    console.error('loadToday error', e);
+    console.error('loadActiveDay error', e);
     el.innerHTML = `<div class="card">Не удалось загрузить день: ${escapeHtml(e.message||String(e))}</div>`;
   }
 }
 
-async function renderToday(){
-  const el = document.getElementById('todayContent');
+async function renderDayWorkflow(){
+  const el = activeContainer();
   const statusEl = document.getElementById('topStatus');
+  const isToday = ACTIVE_CONTEXT === 'today';
+  const backBtn = !isToday ? `<button id="backToArchiveBtn" class="btn btn-outline btn-sm" style="margin-bottom:12px;">← Ко всем дням</button>` : '';
+
+  function bindBackBtn(){
+    const b = document.getElementById('backToArchiveBtn');
+    if(b) b.addEventListener('click', renderArchiveList);
+  }
 
   if(!activeProducts().length){
-    el.innerHTML = `<div class="card">Сначала добавь товары во вкладке «Ассортимент» — потом можно будет открыть день.</div>`;
-    statusEl.textContent='Касса';
+    el.innerHTML = backBtn + `<div class="card">Сначала добавь товары во вкладке «Ассортимент» — потом можно будет открыть день.</div>`;
+    if(isToday) statusEl.textContent='Касса';
+    bindBackBtn();
     return;
   }
 
-  // День уже закрыт — показываем чек
-  if(TODAY_DOC && TODAY_DOC.closed){
-    statusEl.textContent='День закрыт';
-    el.innerHTML = renderReceipt(TODAY_DOC.summary, TODAY_ID);
+  // День закрыт — чек + действия (изменить / очистить)
+  if(ACTIVE_DOC && ACTIVE_DOC.closed){
+    if(isToday) statusEl.textContent='День закрыт';
+    el.innerHTML = backBtn + renderReceipt(ACTIVE_DOC.summary, ACTIVE_DAY) + `
+      <div class="card">
+        <button id="reopenDayBtn" class="btn btn-outline btn-block">Изменить день (переоткрыть)</button>
+        <button id="clearDayBtn" class="btn btn-danger btn-block" style="margin-top:8px;">Очистить день полностью</button>
+      </div>
+    `;
+    bindBackBtn();
+    document.getElementById('reopenDayBtn').addEventListener('click', reopenDay);
+    document.getElementById('clearDayBtn').addEventListener('click', clearDay);
     return;
   }
 
   // Утренний остаток ещё не внесён — форма открытия дня
-  if(!TODAY_DOC || !TODAY_DOC.morning){
-    statusEl.textContent='Открыть день';
-    const prevMorning = await suggestMorning();
-    el.innerHTML = `
+  if(!ACTIVE_DOC || !ACTIVE_DOC.morning){
+    if(isToday) statusEl.textContent='Открыть день';
+    const prevMorning = isToday ? await suggestMorning() : {};
+    el.innerHTML = backBtn + `
       <div class="card">Внеси утренний остаток по каждому товару — сколько целых пачек и отдельных сигарет на месте сейчас.</div>
       <div id="morningForm" class="count-table">
         ${activeProducts().map(p=>countItemHtml(p,'m',prevMorning[p.id])).join('')}
       </div>
-      <button id="saveMorningBtn" class="btn btn-accent btn-block" style="margin-top:14px;">Открыть день</button>
+      <button id="saveMorningBtn" class="btn btn-accent btn-block" style="margin-top:14px;">${isToday?'Открыть день':'Сохранить и открыть день'}</button>
     `;
+    bindBackBtn();
     document.getElementById('saveMorningBtn').addEventListener('click', saveMorning);
     return;
   }
 
   // День открыт — рабочий дашборд
-  statusEl.textContent='День открыт';
-  const totalPurchased = PURCHASES.reduce((s,pu)=>s+sticks(pu.packs,pu.loose,productById(pu.productId)?.packSize||20),0);
-  el.innerHTML = `
+  if(isToday) statusEl.textContent='День открыт';
+  el.innerHTML = backBtn + `
     <div class="stat-row">
       <div class="stat"><div class="label">Товаров учтено</div><div class="value">${activeProducts().length}</div></div>
-      <div class="stat"><div class="label">Закупок сегодня</div><div class="value">${PURCHASES.length}</div></div>
+      <div class="stat"><div class="label">Закупок за день</div><div class="value">${PURCHASES.length}</div></div>
     </div>
-    <button id="addPurchaseBtn" class="btn btn-outline btn-block">+ Внести закупку в течение дня</button>
+    <details class="card">
+      <summary>Ассортимент и что отмечено (${activeProducts().length})</summary>
+      <div class="list" style="margin-top:10px;">
+        ${activeProducts().map(p=>{
+          const m = ACTIVE_DOC.morning[p.id] || {packs:0,loose:0};
+          const purchasedSticks = PURCHASES.filter(pu=>pu.productId===p.id).reduce((s,pu)=>s+sticks(pu.packs,pu.loose,p.packSize),0);
+          const purchasedPacks = Math.floor(purchasedSticks/p.packSize);
+          const purchasedLoose = purchasedSticks % p.packSize;
+          return `
+            <div class="product-row">
+              <div>
+                <div class="name">${escapeHtml(p.name)}</div>
+                <div class="meta">утро: ${m.packs} пач. + ${m.loose} шт${purchasedSticks?` · докуплено: ${purchasedPacks} пач. + ${purchasedLoose} шт`:''} · цена: ${money(p.stickPrice)}/шт</div>
+              </div>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    </details>
+    <button id="addPurchaseBtn" class="btn btn-outline btn-block">+ Внести закупку</button>
     <div id="purchaseListWrap" style="margin-top:14px;">
-      ${PURCHASES.length? `<div class="card"><div style="font-weight:600;margin-bottom:6px;font-size:13px;">Закупки сегодня</div>${PURCHASES.map(pu=>`
+      ${PURCHASES.length? `<div class="card"><div style="font-weight:600;margin-bottom:6px;font-size:13px;">Закупки за день</div>${PURCHASES.map(pu=>`
         <div class="purchase-row"><span>${escapeHtml(productById(pu.productId)?.name||'—')}</span><span>${pu.packs} пач. + ${pu.loose} шт</span></div>
       `).join('')}</div>` : ''}
     </div>
     <button id="closeDayBtn" class="btn btn-primary btn-block" style="margin-top:18px;">Закрыть день (вечерний подсчёт)</button>
+    <button id="clearDayBtn" class="btn btn-danger btn-block" style="margin-top:8px;">Очистить день полностью</button>
   `;
+  bindBackBtn();
   document.getElementById('addPurchaseBtn').addEventListener('click', openPurchaseForm);
   document.getElementById('closeDayBtn').addEventListener('click', renderEveningForm);
+  document.getElementById('clearDayBtn').addEventListener('click', clearDay);
 }
 
 function countItemHtml(p, prefix, prefill){
@@ -266,10 +318,10 @@ async function saveMorning(){
     const item = document.querySelector(`.count-item[data-pid="${p.id}"]`);
     data[p.id] = { packs:Number(item.querySelector('.m-packs').value)||0, loose:Number(item.querySelector('.m-loose').value)||0 };
   });
-  await db.collection('days').doc(TODAY_ID).set({
+  await db.collection('days').doc(ACTIVE_DAY).set({
     morning:data, morningSavedAt:firebase.firestore.FieldValue.serverTimestamp(), closed:false
   }, {merge:true});
-  await loadToday();
+  await loadActiveDay();
 }
 
 function openPurchaseForm(){
@@ -293,19 +345,21 @@ function openPurchaseForm(){
       time: firebase.firestore.FieldValue.serverTimestamp()
     };
     if(entry.packs===0 && entry.loose===0){ alert('Укажи количество'); return; }
-    await db.collection('days').doc(TODAY_ID).collection('purchases').add(entry);
+    await db.collection('days').doc(ACTIVE_DAY).collection('purchases').add(entry);
     closeModal();
-    await loadToday();
+    await loadActiveDay();
   });
 }
 
 function renderEveningForm(){
-  document.getElementById('topStatus').textContent='Вечерний подсчёт';
-  const el = document.getElementById('todayContent');
+  const isToday = ACTIVE_CONTEXT === 'today';
+  if(isToday) document.getElementById('topStatus').textContent='Вечерний подсчёт';
+  const el = activeContainer();
+  const prevEvening = ACTIVE_DOC && ACTIVE_DOC.evening ? ACTIVE_DOC.evening : {};
   el.innerHTML = `
     <div class="card">Посчитай, сколько пачек и отдельных сигарет осталось по каждому товару прямо сейчас.</div>
     <div id="eveningForm" class="count-table">
-      ${activeProducts().map(p=>countItemHtml(p,'e')).join('')}
+      ${activeProducts().map(p=>countItemHtml(p,'e',prevEvening[p.id])).join('')}
     </div>
     <button id="calcSummaryBtn" class="btn btn-accent btn-block" style="margin-top:14px;">Посчитать итог дня</button>
   `;
@@ -316,7 +370,7 @@ function computeSummary(evening){
   const perProduct = {};
   let totalExpected = 0, totalProfit = 0, anomalies=[];
   activeProducts().forEach(p=>{
-    const m = TODAY_DOC.morning[p.id] || {packs:0,loose:0};
+    const m = ACTIVE_DOC.morning[p.id] || {packs:0,loose:0};
     const purchasedSticks = PURCHASES.filter(pu=>pu.productId===p.id)
       .reduce((s,pu)=>s+sticks(pu.packs,pu.loose,p.packSize),0);
     const morningSticks = sticks(m.packs,m.loose,p.packSize);
@@ -343,12 +397,13 @@ function showDaySummaryPreview(){
     evening[p.id] = { packs:Number(item.querySelector('.e-packs').value)||0, loose:Number(item.querySelector('.e-loose').value)||0 };
   });
   const summary = computeSummary(evening);
-  const el = document.getElementById('todayContent');
+  const el = activeContainer();
+  const prevCash = (ACTIVE_DOC && ACTIVE_DOC.summary && ACTIVE_DOC.summary.actualCash!==undefined) ? ACTIVE_DOC.summary.actualCash : '';
   el.innerHTML = `
     ${summary.anomalies.length?`<div class="card" style="border-color:var(--danger);color:var(--danger);">Внимание: у ${summary.anomalies.join(', ')} остаток вечером больше, чем должно быть в наличии. Перепроверь подсчёт или закупки.</div>`:''}
     <div class="card">
       <div style="font-weight:600;margin-bottom:8px;">Ожидаемая выручка: <span style="font-family:var(--font-mono);">${money(summary.totalExpected)}</span></div>
-      <div class="field"><label>Сколько наличных фактически на руках</label><input id="actualCash" type="number" placeholder="0"></div>
+      <div class="field"><label>Сколько наличных фактически на руках</label><input id="actualCash" type="number" placeholder="0" value="${prevCash}"></div>
       <button id="confirmCloseBtn" class="btn btn-primary btn-block">Подтвердить и закрыть день</button>
       <button id="backToEveningBtn" class="btn btn-outline btn-block" style="margin-top:8px;">Назад, исправить подсчёт</button>
     </div>
@@ -358,10 +413,10 @@ function showDaySummaryPreview(){
     const actualCash = Number(document.getElementById('actualCash').value)||0;
     const diff = actualCash - summary.totalExpected;
     const fullSummary = { ...summary, actualCash, diff };
-    await db.collection('days').doc(TODAY_ID).set({
+    await db.collection('days').doc(ACTIVE_DAY).set({
       evening, closed:true, closedAt:firebase.firestore.FieldValue.serverTimestamp(), summary:fullSummary
     }, {merge:true});
-    await loadToday();
+    await loadActiveDay();
   });
 }
 
@@ -385,10 +440,33 @@ function renderReceipt(summary, dayId){
   `;
 }
 
+// ---------- переоткрыть / очистить день ----------
+async function reopenDay(){
+  if(!confirm(`Переоткрыть день ${dateLabel(ACTIVE_DAY)}? Можно будет добавить закупки и заново сделать вечерний подсчёт.`)) return;
+  await db.collection('days').doc(ACTIVE_DAY).set({ closed:false }, {merge:true});
+  await loadActiveDay();
+}
+
+async function clearDay(){
+  if(!confirm(`Полностью очистить день ${dateLabel(ACTIVE_DAY)}? Все данные за этот день (остатки, закупки, итог) удалятся без возможности восстановить.`)) return;
+  const dayRef = db.collection('days').doc(ACTIVE_DAY);
+  const psnap = await dayRef.collection('purchases').get();
+  const batch = db.batch();
+  psnap.docs.forEach(d=>batch.delete(d.ref));
+  batch.delete(dayRef);
+  await batch.commit();
+  if(ACTIVE_CONTEXT==='archive'){
+    renderArchiveList();
+  } else {
+    await loadActiveDay();
+  }
+}
+
 // =================================================================
 // АРХИВ
 // =================================================================
 async function renderArchiveList(){
+  ACTIVE_CONTEXT = 'today'; // на случай если правили архивный день — сбрасываем контекст
   document.getElementById('archiveDetail').classList.add('hidden');
   document.getElementById('archiveDetail').innerHTML='';
   const listEl = document.getElementById('archiveList');
@@ -412,13 +490,12 @@ async function renderArchiveList(){
     return `<div class="archive-row" data-id="${d.id}"><span class="adate">${dateLabel(d.id)}</span><span class="adiff ${cls}">${label}</span></div>`;
   }).join('');
   listEl.querySelectorAll('.archive-row').forEach(row=>{
-    row.addEventListener('click', async ()=>{
-      const doc = await db.collection('days').doc(row.dataset.id).get();
-      const detail = document.getElementById('archiveDetail');
+    row.addEventListener('click', ()=>{
+      ACTIVE_DAY = row.dataset.id;
+      ACTIVE_CONTEXT = 'archive';
       listEl.classList.add('hidden');
-      detail.classList.remove('hidden');
-      detail.innerHTML = `<button class="btn btn-outline btn-sm" id="backArchiveBtn" style="margin-bottom:12px;">← Ко всем дням</button>` + renderReceipt(doc.data().summary, row.dataset.id);
-      document.getElementById('backArchiveBtn').addEventListener('click', renderArchiveList);
+      document.getElementById('archiveDetail').classList.remove('hidden');
+      loadActiveDay();
     });
   });
 }
