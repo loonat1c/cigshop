@@ -168,6 +168,14 @@ details.card .product-row{border-color:var(--paper);background:var(--paper);}
 }
 .purchase-row:last-child{border-bottom:none;}
 
+.stack-row{padding:8px 0;border-bottom:1px dashed var(--border);}
+.stack-row:last-child{border-bottom:none;}
+.stack-row .top{display:flex;justify-content:space-between;font-family:var(--font-mono);font-size:13px;gap:10px;}
+.stack-row .sub{color:var(--muted);font-size:11.5px;margin-top:2px;}
+
+.receipt .r-sub{opacity:.65;font-size:11.5px;margin-top:-2px;margin-bottom:6px;}
+.receipt .r-sub span{font-family:var(--font-mono);}
+
 /* ---------- RECEIPT (день закрыт) ---------- */
 .receipt{
   background:#fff;border-radius:10px;padding:22px 18px;
