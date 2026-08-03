@@ -34,6 +34,47 @@ function sticks(packs, loose, packSize){
 function activeProducts(){ return PRODUCTS.filter(p=>!p.archived); }
 function productById(id){ return PRODUCTS.find(p=>p.id===id); }
 
+// нормализация закупки: новая форма — {items:[{productId,packs,price}], totalPaid,...}
+// старая форма (до многопозиционных закупок) — {productId, packs, loose, paidAmount}
+function purchaseItems(pu){
+  if(pu.items) return pu.items;
+  return [{ productId: pu.productId, packs: pu.packs||0, looseLegacy: pu.loose||0 }];
+}
+function purchasePaid(pu){
+  return Number(pu.totalPaid!==undefined ? pu.totalPaid : pu.paidAmount) || 0;
+}
+function purchasedSticksForProduct(pid){
+  const p = productById(pid);
+  if(!p) return 0;
+  return PURCHASES.reduce((s,pu)=> s + purchaseItems(pu)
+    .filter(it=>it.productId===pid)
+    .reduce((s2,it)=> s2 + (Number(it.packs)||0)*p.packSize + (Number(it.looseLegacy)||0), 0), 0);
+}
+
+// товары, которые реально в деле сегодня: были на утро или что-то докупили.
+// товары с 0/0 на утро и без докупки не засоряют экран дня (но остаются в ассортименте).
+function dayProducts(){
+  if(!ACTIVE_DOC || !ACTIVE_DOC.morning) return activeProducts();
+  return activeProducts().filter(p=>{
+    const m = ACTIVE_DOC.morning[p.id] || {packs:0,loose:0};
+    const morningHas = (Number(m.packs)||0) > 0 || (Number(m.loose)||0) > 0;
+    return morningHas || purchasedSticksForProduct(p.id) > 0;
+  });
+}
+
+// подсказка цены за штуку на основе уже введённых товаров: считаем средний коэффициент
+// наценки (цена/шт ÷ цена пачки/размер пачки) по существующему ассортименту и применяем его
+function suggestStickPrice(packPrice, packSize){
+  const refs = activeProducts().filter(p=>p.packPrice>0 && p.packSize>0 && p.stickPrice>0);
+  if(refs.length){
+    const ratios = refs.map(p => p.stickPrice / (p.packPrice/p.packSize));
+    const avgRatio = ratios.reduce((a,b)=>a+b,0) / ratios.length;
+    const raw = (packPrice/packSize) * avgRatio;
+    return Math.max(1, Math.round(raw/100)*100);
+  }
+  return Math.ceil(packPrice/packSize);
+}
+
 // ---------- AUTH ----------
 document.getElementById('loginForm').addEventListener('submit', e=>{
   e.preventDefault();
@@ -131,19 +172,21 @@ function openProductForm(id){
       <div class="field"><label>Штук в пачке</label><input id="pf-size" type="number" value="${p?p.packSize:20}"></div>
       <div class="field"><label>Цена за пачку</label><input id="pf-packprice" type="number" value="${p?p.packPrice:''}"></div>
     </div>
-    <div class="field"><label>Цена за 1 шт (вразвес)</label><input id="pf-stickprice" type="number" value="${p?p.stickPrice:''}" placeholder="можно дороже, чем пачка/шт"></div>
+    <div class="field"><label>Цена за 1 шт (вразвес)</label><input id="pf-stickprice" type="number" value="${p?p.stickPrice:''}" placeholder="подставится автоматически"></div>
     <div class="field"><label>Закупочная цена за пачку (необязательно, для прибыли)</label><input id="pf-cost" type="number" value="${p&&p.costPrice?p.costPrice:''}"></div>
     <button id="pf-save" class="btn btn-primary btn-block">Сохранить</button>
     ${p?'<button id="pf-archive" class="btn btn-outline btn-block" style="margin-top:8px;">Убрать из ассортимента</button>':''}
   `);
-  document.getElementById('pf-packprice').addEventListener('change', ()=>{
+  function resuggest(){
     const sf=document.getElementById('pf-stickprice');
     if(!sf.value){
       const size=Number(document.getElementById('pf-size').value)||1;
       const pp=Number(document.getElementById('pf-packprice').value)||0;
-      sf.value = Math.ceil(pp/size);
+      if(pp>0) sf.value = suggestStickPrice(pp, size);
     }
-  });
+  }
+  document.getElementById('pf-packprice').addEventListener('change', resuggest);
+  document.getElementById('pf-size').addEventListener('change', resuggest);
   document.getElementById('pf-save').addEventListener('click', async ()=>{
     const data = {
       name: document.getElementById('pf-name').value.trim(),
@@ -262,40 +305,32 @@ async function renderDayWorkflow(){
 
   // День открыт — рабочий дашборд
   if(isToday) statusEl.textContent='День открыт';
+  const dp = dayProducts();
   el.innerHTML = backBtn + `
     <div class="stat-row">
-      <div class="stat"><div class="label">Товаров учтено</div><div class="value">${activeProducts().length}</div></div>
+      <div class="stat"><div class="label">В деле сегодня</div><div class="value">${dp.length}</div></div>
       <div class="stat"><div class="label">Закупок</div><div class="value">${PURCHASES.length}</div></div>
       <div class="stat"><div class="label">Расходов</div><div class="value">${EXPENSES.length}</div></div>
     </div>
     <details class="card">
-      <summary>Ассортимент и что отмечено (${activeProducts().length})</summary>
-      <div class="list" style="margin-top:10px;">
-        ${activeProducts().map(p=>{
-          const m = ACTIVE_DOC.morning[p.id] || {packs:0,loose:0};
-          const purchasedSticks = PURCHASES.filter(pu=>pu.productId===p.id).reduce((s,pu)=>s+sticks(pu.packs,pu.loose,p.packSize),0);
-          const purchasedPacks = Math.floor(purchasedSticks/p.packSize);
-          const purchasedLoose = purchasedSticks % p.packSize;
-          return `
-            <div class="product-row">
-              <div>
-                <div class="name">${escapeHtml(p.name)}</div>
-                <div class="meta">утро: ${m.packs} пач. + ${m.loose} шт · цена: ${money(p.stickPrice)}/шт</div>
-                ${purchasedSticks?`<div class="meta" style="margin-top:2px;color:var(--teal);">докуплено: ${purchasedPacks} пач. + ${purchasedLoose} шт</div>`:''}
-              </div>
-            </div>
-          `;
-        }).join('')}
-      </div>
+      <summary>Ассортимент дня (${dp.length})</summary>
+      <div style="margin-top:10px;">${renderDayAssortmentReceipt(dp)}</div>
     </details>
-    <div class="field-row">
+    <button id="editMorningBtn" class="btn btn-outline btn-block" style="margin-top:8px;">Изменить утренний остаток</button>
+    <div class="field-row" style="margin-top:10px;">
       <button id="addPurchaseBtn" class="btn btn-outline" style="flex:1;">+ Закупка</button>
       <button id="addExpenseBtn" class="btn btn-outline" style="flex:1;">+ Расход</button>
     </div>
     <div id="purchaseListWrap" style="margin-top:4px;">
-      ${PURCHASES.length? `<div class="card"><div style="font-weight:600;margin-bottom:6px;font-size:13px;">Закупки за день</div>${PURCHASES.map(pu=>`
-        <div class="purchase-row"><span>${escapeHtml(productById(pu.productId)?.name||'—')}</span><span>${pu.packs} пач. + ${pu.loose} шт${pu.paidAmount?` · ${money(pu.paidAmount)}${pu.paidFromCash===false?' (не из кассы)':''}`:''}</span></div>
-      `).join('')}</div>` : ''}
+      ${PURCHASES.length? `<div class="card"><div style="font-weight:600;margin-bottom:6px;font-size:13px;">Закупки за день</div>${PURCHASES.map(pu=>{
+        const items = purchaseItems(pu);
+        const desc = items.map(it=>`${productById(it.productId)?.name||'—'} ${it.packs||0} пач.${it.looseLegacy?` + ${it.looseLegacy} шт`:''}`).join(', ');
+        const paid = purchasePaid(pu);
+        return `<div class="stack-row">
+          <div class="top"><span>${escapeHtml(desc)}</span><span>${paid?money(paid):'—'}${pu.paidFromCash===false?' (не из кассы)':''}</span></div>
+          ${pu.note?`<div class="sub">${escapeHtml(pu.note)}</div>`:''}
+        </div>`;
+      }).join('')}</div>` : ''}
       ${EXPENSES.length? `<div class="card"><div style="font-weight:600;margin-bottom:6px;font-size:13px;">Расходы за день</div>${EXPENSES.map(ex=>`
         <div class="purchase-row"><span>${escapeHtml(ex.note||'Расход')}</span><span>${money(ex.amount)}</span></div>
       `).join('')}</div>` : ''}
@@ -304,10 +339,30 @@ async function renderDayWorkflow(){
     <button id="clearDayBtn" class="btn btn-danger btn-block" style="margin-top:8px;">Очистить день полностью</button>
   `;
   bindBackBtn();
+  document.getElementById('editMorningBtn').addEventListener('click', renderMorningEditForm);
   document.getElementById('addPurchaseBtn').addEventListener('click', openPurchaseForm);
   document.getElementById('addExpenseBtn').addEventListener('click', openExpenseForm);
   document.getElementById('closeDayBtn').addEventListener('click', renderEveningForm);
   document.getElementById('clearDayBtn').addEventListener('click', clearDay);
+}
+
+function renderDayAssortmentReceipt(dp){
+  return `
+    <div class="receipt">
+      <div class="r-title">Ассортимент дня</div>
+      <div class="r-date">${dateLabel(ACTIVE_DAY)}</div>
+      ${dp.map(p=>{
+        const m = ACTIVE_DOC.morning[p.id] || {packs:0,loose:0};
+        const purchasedSticks = purchasedSticksForProduct(p.id);
+        const purchasedPacks = Math.floor(purchasedSticks/p.packSize);
+        const purchasedLoose = purchasedSticks % p.packSize;
+        return `
+          <div class="r-line"><span class="r-name">${escapeHtml(p.name)}</span><span class="r-num">${m.packs} пач. + ${m.loose} шт</span></div>
+          <div class="r-line r-sub"><span>пачка ${money(p.packPrice)} · шт ${money(p.stickPrice)}${purchasedSticks?` · докуплено ${purchasedPacks} пач.${purchasedLoose?` + ${purchasedLoose} шт`:''}`:''}</span><span></span></div>
+        `;
+      }).join('')}
+    </div>
+  `;
 }
 
 function countItemHtml(p, prefix, prefill){
@@ -339,6 +394,20 @@ async function suggestMorning(){
   }
 }
 
+function renderMorningEditForm(){
+  const el = activeContainer();
+  el.innerHTML = `
+    <div class="card">Поправь утренний остаток, если что-то забыли отметить в начале дня — это не докупка, а исправление исходных цифр.</div>
+    <div id="morningForm" class="count-table">
+      ${activeProducts().map(p=>countItemHtml(p,'m',ACTIVE_DOC.morning[p.id])).join('')}
+    </div>
+    <button id="saveMorningBtn" class="btn btn-accent btn-block" style="margin-top:14px;">Сохранить изменения</button>
+    <button id="cancelMorningEditBtn" class="btn btn-outline btn-block" style="margin-top:8px;">Отмена</button>
+  `;
+  document.getElementById('saveMorningBtn').addEventListener('click', saveMorning);
+  document.getElementById('cancelMorningEditBtn').addEventListener('click', renderDayWorkflow);
+}
+
 async function saveMorning(){
   const data = {};
   activeProducts().forEach(p=>{
@@ -351,37 +420,108 @@ async function saveMorning(){
   await loadActiveDay();
 }
 
+// ---------- ЗАКУПКА (несколько позиций сразу, только пачками) ----------
 function openPurchaseForm(){
-  openModal('Внести закупку', `
-    <div class="field"><label>Товар</label>
-      <select id="pu-product">${activeProducts().map(p=>`<option value="${p.id}">${escapeHtml(p.name)}</option>`).join('')}</select>
-    </div>
-    <div class="field-row">
-      <div class="field"><label>Пачек</label><input id="pu-packs" type="number" min="0" value="0"></div>
-      <div class="field"><label>Штук (россыпь)</label><input id="pu-loose" type="number" min="0" value="0"></div>
-    </div>
-    <div class="field"><label>Сколько заплатила всего (необязательно — цена могла быть другой, чем обычно)</label><input id="pu-paid" type="number" min="0" placeholder="0"></div>
-    <label style="display:flex;align-items:center;gap:8px;font-size:13.5px;margin:2px 0 14px;">
-      <input type="checkbox" id="pu-fromcash" checked style="width:auto;"> Оплачено из кассы (учитывать при подсчёте налички)
-    </label>
-    <div class="field"><label>Заметка (необязательно)</label><input id="pu-note" placeholder="напр. довезли с оптовой базы"></div>
-    <button id="pu-save" class="btn btn-primary btn-block">Добавить</button>
-  `);
-  document.getElementById('pu-save').addEventListener('click', async ()=>{
-    const entry = {
-      productId: document.getElementById('pu-product').value,
-      packs: Number(document.getElementById('pu-packs').value)||0,
-      loose: Number(document.getElementById('pu-loose').value)||0,
-      paidAmount: Number(document.getElementById('pu-paid').value)||0,
-      paidFromCash: document.getElementById('pu-fromcash').checked,
-      note: document.getElementById('pu-note').value.trim(),
-      time: firebase.firestore.FieldValue.serverTimestamp()
-    };
-    if(entry.packs===0 && entry.loose===0){ alert('Укажи количество'); return; }
-    await db.collection('days').doc(ACTIVE_DAY).collection('purchases').add(entry);
-    closeModal();
-    await loadActiveDay();
-  });
+  const prods = activeProducts();
+  if(!prods.length){ alert('Сначала добавь товары в ассортимент'); return; }
+  let rows = [{ productId: prods[0].id, packs: 1, price: prods[0].packPrice||0 }];
+  let totalEdited = false;
+  let manualTotal = 0;
+
+  function calcTotal(){
+    return rows.reduce((s,r)=> s + (Number(r.packs)||0) * (Number(r.price)||0), 0);
+  }
+
+  function render(){
+    const total = totalEdited ? manualTotal : calcTotal();
+    document.getElementById('modalTitle').textContent = 'Внести закупку';
+    modalBody.innerHTML = `
+      <div id="rowsWrap">${rows.map((r,i)=>`
+        <div class="field-row" style="align-items:flex-end;">
+          <div class="field" style="flex:2;">
+            <label>Товар</label>
+            <select class="row-product" data-idx="${i}">${activeProducts().map(p=>`<option value="${p.id}" ${p.id===r.productId?'selected':''}>${escapeHtml(p.name)}</option>`).join('')}</select>
+          </div>
+          <div class="field" style="flex:1;">
+            <label>Пачек</label>
+            <input type="number" min="0" class="row-packs" data-idx="${i}" value="${r.packs}">
+          </div>
+          <div class="field" style="flex:1;">
+            <label>Цена/пач.</label>
+            <input type="number" min="0" class="row-price" data-idx="${i}" value="${r.price}">
+          </div>
+          ${rows.length>1?`<button class="row-remove btn btn-outline btn-sm" data-idx="${i}" style="margin-bottom:12px;">✕</button>`:''}
+        </div>
+      `).join('')}</div>
+      <button id="addRowBtn" class="btn btn-outline btn-sm" style="margin-bottom:14px;">+ Добавить позицию</button>
+      <div class="field"><label>Итого заплачено (считается автоматически, можно поправить)</label><input id="pu-total" type="number" min="0" value="${total}"></div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13.5px;margin:2px 0 14px;">
+        <input type="checkbox" id="pu-fromcash" checked style="width:auto;"> Оплачено из кассы (учитывать при подсчёте налички)
+      </label>
+      <div class="field"><label>Заметка (необязательно)</label><input id="pu-note" placeholder="напр. довезли с оптовой базы"></div>
+      <button id="pu-save" class="btn btn-primary btn-block">Добавить закупку</button>
+    `;
+    modalOverlay.classList.remove('hidden');
+    wire();
+  }
+
+  function updateTotalField(){
+    if(!totalEdited){
+      const t = document.getElementById('pu-total');
+      if(t) t.value = calcTotal();
+    }
+  }
+
+  function wire(){
+    modalBody.querySelectorAll('.row-product').forEach(sel=>sel.addEventListener('change', e=>{
+      const i = Number(e.target.dataset.idx);
+      rows[i].productId = e.target.value;
+      const p = productById(e.target.value);
+      rows[i].price = p ? p.packPrice : 0;
+      render();
+    }));
+    modalBody.querySelectorAll('.row-packs').forEach(inp=>inp.addEventListener('input', e=>{
+      rows[Number(e.target.dataset.idx)].packs = e.target.value;
+      updateTotalField();
+    }));
+    modalBody.querySelectorAll('.row-price').forEach(inp=>inp.addEventListener('input', e=>{
+      rows[Number(e.target.dataset.idx)].price = e.target.value;
+      updateTotalField();
+    }));
+    modalBody.querySelectorAll('.row-remove').forEach(btn=>btn.addEventListener('click', e=>{
+      rows.splice(Number(e.target.dataset.idx),1);
+      render();
+    }));
+    document.getElementById('addRowBtn').addEventListener('click', ()=>{
+      const p = activeProducts()[0];
+      rows.push({ productId: p.id, packs:1, price: p.packPrice||0 });
+      render();
+    });
+    document.getElementById('pu-total').addEventListener('input', e=>{
+      totalEdited = true;
+      manualTotal = Number(e.target.value)||0;
+    });
+    document.getElementById('pu-save').addEventListener('click', async ()=>{
+      const items = rows.filter(r=>Number(r.packs)>0).map(r=>({
+        productId: r.productId, packs: Number(r.packs)||0, price: Number(r.price)||0
+      }));
+      if(!items.length){ alert('Добавь хотя бы одну позицию с количеством пачек'); return; }
+      const totalPaid = Number(document.getElementById('pu-total').value)||0;
+      const entry = {
+        items,
+        totalPaid,
+        paidFromCash: document.getElementById('pu-fromcash').checked,
+        note: document.getElementById('pu-note').value.trim(),
+        time: firebase.firestore.FieldValue.serverTimestamp()
+      };
+      await db.collection('days').doc(ACTIVE_DAY).collection('purchases').add(entry);
+      closeModal();
+      await loadActiveDay();
+    });
+  }
+
+  openModal('Внести закупку', '');
+  render();
 }
 
 function openExpenseForm(){
@@ -409,10 +549,11 @@ function renderEveningForm(){
   if(isToday) document.getElementById('topStatus').textContent='Вечерний подсчёт';
   const el = activeContainer();
   const prevEvening = ACTIVE_DOC && ACTIVE_DOC.evening ? ACTIVE_DOC.evening : {};
+  const dp = dayProducts();
   el.innerHTML = `
     <div class="card">Посчитай, сколько пачек и отдельных сигарет осталось по каждому товару прямо сейчас.</div>
     <div id="eveningForm" class="count-table">
-      ${activeProducts().map(p=>countItemHtml(p,'e',prevEvening[p.id])).join('')}
+      ${dp.map(p=>countItemHtml(p,'e',prevEvening[p.id])).join('')}
     </div>
     <button id="calcSummaryBtn" class="btn btn-accent btn-block" style="margin-top:14px;">Посчитать итог дня</button>
   `;
@@ -422,10 +563,9 @@ function renderEveningForm(){
 function computeSummary(evening){
   const perProduct = {};
   let totalExpected = 0, totalProfit = 0, anomalies=[];
-  activeProducts().forEach(p=>{
+  dayProducts().forEach(p=>{
     const m = ACTIVE_DOC.morning[p.id] || {packs:0,loose:0};
-    const purchasedSticks = PURCHASES.filter(pu=>pu.productId===p.id)
-      .reduce((s,pu)=>s+sticks(pu.packs,pu.loose,p.packSize),0);
+    const purchasedSticks = purchasedSticksForProduct(p.id);
     const morningSticks = sticks(m.packs,m.loose,p.packSize);
     const eveningSticks = sticks(evening[p.id].packs, evening[p.id].loose, p.packSize);
     const available = morningSticks + purchasedSticks;
@@ -442,13 +582,16 @@ function computeSummary(evening){
   });
 
   // деньги, реально ушедшие из кассы за день — закупки (по фактически уплаченной сумме) и расходы
-  const totalPurchaseCash = PURCHASES.reduce((s,pu)=> s + (pu.paidFromCash!==false ? (Number(pu.paidAmount)||0) : 0), 0);
+  const totalPurchaseCash = PURCHASES.reduce((s,pu)=> s + (pu.paidFromCash!==false ? purchasePaid(pu) : 0), 0);
   const totalExpenses = EXPENSES.reduce((s,ex)=> s + (Number(ex.amount)||0), 0);
   const netExpectedCash = totalExpected - totalPurchaseCash - totalExpenses;
 
   const purchaseLines = PURCHASES
-    .filter(pu=> pu.paidFromCash!==false && (Number(pu.paidAmount)||0) > 0)
-    .map(pu=>({ name: productById(pu.productId)?.name || '—', amount: Number(pu.paidAmount)||0 }));
+    .filter(pu=> pu.paidFromCash!==false && purchasePaid(pu) > 0)
+    .map(pu=>{
+      const desc = purchaseItems(pu).map(it=> `${productById(it.productId)?.name||'—'} ×${it.packs||0}`).join(', ');
+      return { name: desc, amount: purchasePaid(pu) };
+    });
   const expenseLines = EXPENSES.map(ex=>({ note: ex.note || 'Расход', amount: Number(ex.amount)||0 }));
 
   return { perProduct, totalExpected, totalProfit, anomalies, totalPurchaseCash, totalExpenses, netExpectedCash, purchaseLines, expenseLines };
@@ -456,7 +599,7 @@ function computeSummary(evening){
 
 function showDaySummaryPreview(){
   const evening = {};
-  activeProducts().forEach(p=>{
+  dayProducts().forEach(p=>{
     const item = document.querySelector(`.count-item[data-pid="${p.id}"]`);
     evening[p.id] = { packs:Number(item.querySelector('.e-packs').value)||0, loose:Number(item.querySelector('.e-loose').value)||0 };
   });
