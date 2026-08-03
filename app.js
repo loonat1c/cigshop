@@ -306,12 +306,20 @@ async function renderDayWorkflow(){
   // День открыт — рабочий дашборд
   if(isToday) statusEl.textContent='День открыт';
   const dp = dayProducts();
+  const running = computeRunningTotals();
   el.innerHTML = backBtn + `
     <div class="stat-row">
       <div class="stat"><div class="label">В деле сегодня</div><div class="value">${dp.length}</div></div>
       <div class="stat"><div class="label">Закупок</div><div class="value">${PURCHASES.length}</div></div>
       <div class="stat"><div class="label">Расходов</div><div class="value">${EXPENSES.length}</div></div>
     </div>
+    <div class="receipt">
+      <div class="r-title">Промежуточный итог</div>
+      <div class="r-line"><span class="r-name">Ассортимент (по цене продажи)</span><span class="r-num">${money(running.assortmentValue)}</span></div>
+      <div class="r-line"><span class="r-name">Закуплено из кассы</span><span class="r-num">−${money(running.totalPurchaseCash)}</span></div>
+      <div class="r-line"><span class="r-name">Расходы</span><span class="r-num">−${money(running.totalExpenses)}</span></div>
+    </div>
+    <div style="height:12px;"></div>
     <details class="card">
       <summary>Ассортимент дня (${dp.length})</summary>
       <div style="margin-top:10px;">${renderDayAssortmentReceipt(dp)}</div>
@@ -558,6 +566,19 @@ function renderEveningForm(){
     <button id="calcSummaryBtn" class="btn btn-accent btn-block" style="margin-top:14px;">Посчитать итог дня</button>
   `;
   document.getElementById('calcSummaryBtn').addEventListener('click', showDaySummaryPreview);
+}
+
+// промежуточный итог за день — без вечернего подсчёта, обновляется сразу при любой закупке/расходе
+function computeRunningTotals(){
+  let assortmentValue = 0;
+  dayProducts().forEach(p=>{
+    const m = ACTIVE_DOC.morning[p.id] || {packs:0,loose:0};
+    const totalSticks = sticks(m.packs,m.loose,p.packSize) + purchasedSticksForProduct(p.id);
+    assortmentValue += totalSticks * p.stickPrice;
+  });
+  const totalPurchaseCash = PURCHASES.reduce((s,pu)=> s + (pu.paidFromCash!==false ? purchasePaid(pu) : 0), 0);
+  const totalExpenses = EXPENSES.reduce((s,ex)=> s + (Number(ex.amount)||0), 0);
+  return { assortmentValue, totalPurchaseCash, totalExpenses };
 }
 
 function computeSummary(evening){
