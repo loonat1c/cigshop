@@ -10,7 +10,7 @@ try{
 
 let PRODUCTS = [];          // кэш ассортимента [{id,name,packSize,packPrice,stickPrice,costPrice,archived}]
 let TODAY_ID = dateId(new Date());  // реальная сегодняшняя дата
-let ACTIVE_DAY = TODAY_ID;          // день, который сейчас показан на экране (может быть архивный)
+let ACTIVE_DAY = TODAY_ID;          // день, который сейчас показан на экране (может быть архивный или незакрытый с прошлой даты)
 let ACTIVE_CONTEXT = 'today';       // 'today' | 'archive'
 let ACTIVE_DOC = null;              // данные ACTIVE_DAY из Firestore
 let PURCHASES = [];                 // закупки ACTIVE_DAY
@@ -34,14 +34,22 @@ function sticks(packs, loose, packSize){
 function activeProducts(){ return PRODUCTS.filter(p=>!p.archived); }
 function productById(id){ return PRODUCTS.find(p=>p.id===id); }
 
-// нормализация закупки: новая форма — {items:[{productId,packs,price}], totalPaid,...}
-// старая форма (до многопозиционных закупок) — {productId, packs, loose, paidAmount}
+// нормализация закупки: новая форма — {items:[{productId,packs,cost,sell}], totalPaid,...}
+// старая форма (одна позиция) — {productId, packs, loose, paidAmount}
 function purchaseItems(pu){
   if(pu.items) return pu.items;
   return [{ productId: pu.productId, packs: pu.packs||0, looseLegacy: pu.loose||0 }];
 }
 function purchasePaid(pu){
   return Number(pu.totalPaid!==undefined ? pu.totalPaid : pu.paidAmount) || 0;
+}
+function itemCost(it){
+  // цена закупки за пачку. у самых старых записей поле называлось "price" — трактуем его как закупочную
+  return it.cost!==undefined ? Number(it.cost)||0 : Number(it.price)||0;
+}
+function itemSell(it){
+  // цена продажи за пачку — берём сохранённую на момент закупки, иначе текущую цену товара
+  return it.sell!==undefined ? Number(it.sell)||0 : (productById(it.productId)?.packPrice||0);
 }
 function purchasedSticksForProduct(pid){
   const p = productById(pid);
@@ -104,7 +112,6 @@ auth.onAuthStateChanged(user=>{
 });
 
 async function boot(){
-  document.getElementById('topDate').textContent = dateLabel(TODAY_ID);
   await loadProducts();
   await loadToday();
 }
@@ -117,7 +124,7 @@ document.querySelectorAll('.tab').forEach(btn=>{
     const view = btn.dataset.view;
     document.querySelectorAll('.view').forEach(v=>v.classList.add('hidden'));
     document.getElementById('view-'+view).classList.remove('hidden');
-    if(view==='today') loadToday();          // сброс на реальный сегодняшний день
+    if(view==='today') loadToday();
     if(view==='products') renderProducts();
     if(view==='archive') renderArchiveList();
   });
@@ -224,8 +231,21 @@ function activeContainer(){
 }
 
 async function loadToday(){
-  ACTIVE_DAY = TODAY_ID;
   ACTIVE_CONTEXT = 'today';
+  ACTIVE_DAY = TODAY_ID;
+  // если есть незакрытый день с прошлой даты (не успели закрыть до полуночи) — продолжаем именно его,
+  // а не начинаем новый пустой сегодняшний день
+  try{
+    const snap = await db.collection('days').where('closed','==',false).get();
+    const openDays = snap.docs.filter(d=> d.data().morning);
+    if(openDays.length){
+      openDays.sort((a,b)=> b.id.localeCompare(a.id));
+      ACTIVE_DAY = openDays[0].id;
+    }
+  }catch(e){
+    console.error('find open day error', e);
+  }
+  document.getElementById('topDate').textContent = dateLabel(ACTIVE_DAY);
   await loadActiveDay();
 }
 
@@ -259,6 +279,9 @@ async function renderDayWorkflow(){
   const statusEl = document.getElementById('topStatus');
   const isToday = ACTIVE_CONTEXT === 'today';
   const backBtn = !isToday ? `<button id="backToArchiveBtn" class="btn btn-outline btn-sm" style="margin-bottom:12px;">← Ко всем дням</button>` : '';
+  const staleBanner = (isToday && ACTIVE_DAY !== TODAY_ID)
+    ? `<div class="card" style="border-color:var(--gold);"><b>Незакрытый день за ${dateLabel(ACTIVE_DAY)}</b><div style="margin-top:4px;color:var(--muted);font-size:13px;">Сегодня уже ${dateLabel(TODAY_ID)}. Закрой этот день, когда будет удобно — новый сегодняшний день откроется отдельно, ничего не сотрётся.</div></div>`
+    : '';
 
   function bindBackBtn(){
     const b = document.getElementById('backToArchiveBtn');
@@ -291,7 +314,7 @@ async function renderDayWorkflow(){
   if(!ACTIVE_DOC || !ACTIVE_DOC.morning){
     if(isToday) statusEl.textContent='Открыть день';
     const prevMorning = isToday ? await suggestMorning() : {};
-    el.innerHTML = backBtn + `
+    el.innerHTML = backBtn + staleBanner + `
       <div class="card">Внеси утренний остаток по каждому товару — сколько целых пачек и отдельных сигарет на месте сейчас.</div>
       <div id="morningForm" class="count-table">
         ${activeProducts().map(p=>countItemHtml(p,'m',prevMorning[p.id])).join('')}
@@ -307,7 +330,7 @@ async function renderDayWorkflow(){
   if(isToday) statusEl.textContent='День открыт';
   const dp = dayProducts();
   const running = computeRunningTotals();
-  el.innerHTML = backBtn + `
+  el.innerHTML = backBtn + staleBanner + `
     <div class="stat-row">
       <div class="stat"><div class="label">В деле сегодня</div><div class="value">${dp.length}</div></div>
       <div class="stat"><div class="label">Закупок</div><div class="value">${PURCHASES.length}</div></div>
@@ -330,16 +353,8 @@ async function renderDayWorkflow(){
       <button id="addExpenseBtn" class="btn btn-outline" style="flex:1;">+ Расход</button>
     </div>
     <div id="purchaseListWrap" style="margin-top:4px;">
-      ${PURCHASES.length? `<div class="card"><div style="font-weight:600;margin-bottom:6px;font-size:13px;">Закупки за день</div>${PURCHASES.map(pu=>{
-        const items = purchaseItems(pu);
-        const desc = items.map(it=>`${productById(it.productId)?.name||'—'} ${it.packs||0} пач.${it.looseLegacy?` + ${it.looseLegacy} шт`:''}`).join(', ');
-        const paid = purchasePaid(pu);
-        return `<div class="stack-row">
-          <div class="top"><span>${escapeHtml(desc)}</span><span>${paid?money(paid):'—'}${pu.paidFromCash===false?' (не из кассы)':''}</span></div>
-          ${pu.note?`<div class="sub">${escapeHtml(pu.note)}</div>`:''}
-        </div>`;
-      }).join('')}</div>` : ''}
-      ${EXPENSES.length? `<div class="card"><div style="font-weight:600;margin-bottom:6px;font-size:13px;">Расходы за день</div>${EXPENSES.map(ex=>`
+      ${PURCHASES.length? `<div class="receipt"><div class="r-title">Закупки за день</div>${PURCHASES.map((pu,idx)=> purchaseBatchHtml(pu) + (idx<PURCHASES.length-1?'<hr>':'')).join('')}</div>` : ''}
+      ${EXPENSES.length? `<div class="card" style="margin-top:12px;"><div style="font-weight:600;margin-bottom:6px;font-size:13px;">Расходы за день</div>${EXPENSES.map(ex=>`
         <div class="purchase-row"><span>${escapeHtml(ex.note||'Расход')}</span><span>${money(ex.amount)}</span></div>
       `).join('')}</div>` : ''}
     </div>
@@ -348,10 +363,41 @@ async function renderDayWorkflow(){
   `;
   bindBackBtn();
   document.getElementById('editMorningBtn').addEventListener('click', renderMorningEditForm);
-  document.getElementById('addPurchaseBtn').addEventListener('click', openPurchaseForm);
+  document.getElementById('addPurchaseBtn').addEventListener('click', ()=>openPurchaseForm());
   document.getElementById('addExpenseBtn').addEventListener('click', openExpenseForm);
   document.getElementById('closeDayBtn').addEventListener('click', renderEveningForm);
   document.getElementById('clearDayBtn').addEventListener('click', clearDay);
+  document.querySelectorAll('.edit-purchase').forEach(b=>b.addEventListener('click', ()=>openPurchaseForm(b.dataset.id)));
+  document.querySelectorAll('.delete-purchase').forEach(b=>b.addEventListener('click', async ()=>{
+    if(!confirm('Удалить эту закупку из учёта дня?')) return;
+    await db.collection('days').doc(ACTIVE_DAY).collection('purchases').doc(b.dataset.id).delete();
+    await loadActiveDay();
+  }));
+}
+
+// структурированная строка закупки: название, кол-во, закупочная и цена продажи, итог по закупке, правка/удаление
+function purchaseBatchHtml(pu){
+  const items = purchaseItems(pu);
+  const paid = purchasePaid(pu);
+  const rows = items.map(it=>{
+    const p = productById(it.productId);
+    const cost = itemCost(it), sell = itemSell(it);
+    return `
+      <div class="r-line"><span class="r-name">${escapeHtml(p?p.name:'—')} × ${it.packs||0} пач.${it.looseLegacy?` + ${it.looseLegacy} шт`:''}</span><span class="r-num">${money(cost*(it.packs||0))}</span></div>
+      <div class="r-line r-sub"><span>закуп ${money(cost)}/пач · продажа ${money(sell)}/пач</span><span></span></div>
+    `;
+  }).join('');
+  return `
+    <div>
+      ${rows}
+      <div class="r-total" style="margin-top:2px;"><span>Итого закупки</span><span>${money(paid)}${pu.paidFromCash===false?' (не из кассы)':''}</span></div>
+      ${pu.note?`<div class="r-sub" style="margin-top:2px;">${escapeHtml(pu.note)}</div>`:''}
+      <div style="display:flex;gap:8px;margin-top:8px;">
+        <button class="btn btn-outline btn-sm edit-purchase" data-id="${pu.id}" style="flex:1;">Изменить</button>
+        <button class="btn btn-danger btn-sm delete-purchase" data-id="${pu.id}" style="flex:1;">Удалить</button>
+      </div>
+    </div>
+  `;
 }
 
 function renderDayAssortmentReceipt(dp){
@@ -428,21 +474,31 @@ async function saveMorning(){
   await loadActiveDay();
 }
 
-// ---------- ЗАКУПКА (несколько позиций сразу, только пачками) ----------
-function openPurchaseForm(){
+// ---------- ЗАКУПКА (несколько позиций сразу, только пачками, с закупочной и продажной ценой) ----------
+function openPurchaseForm(existingId){
+  const existing = existingId ? PURCHASES.find(pu=>pu.id===existingId) : null;
   const prods = activeProducts();
   if(!prods.length){ alert('Сначала добавь товары в ассортимент'); return; }
-  let rows = [{ productId: prods[0].id, packs: 1, price: prods[0].packPrice||0 }];
-  let totalEdited = false;
-  let manualTotal = 0;
+
+  function defaultsFor(p){
+    return { productId: p.id, packs: 1, cost: (p.costPrice&&p.costPrice>0)?p.costPrice:(p.packPrice||0), sell: p.packPrice||0 };
+  }
+
+  let rows = existing
+    ? purchaseItems(existing).map(it=>({ productId: it.productId, packs: it.packs||0, cost: itemCost(it), sell: itemSell(it) }))
+    : [defaultsFor(prods[0])];
+  let totalEdited = !!existing;
+  let manualTotal = existing ? purchasePaid(existing) : 0;
+  let paidFromCash = existing ? (existing.paidFromCash!==false) : true;
+  let noteVal = existing ? (existing.note||'') : '';
 
   function calcTotal(){
-    return rows.reduce((s,r)=> s + (Number(r.packs)||0) * (Number(r.price)||0), 0);
+    return rows.reduce((s,r)=> s + (Number(r.packs)||0) * (Number(r.cost)||0), 0);
   }
 
   function render(){
     const total = totalEdited ? manualTotal : calcTotal();
-    document.getElementById('modalTitle').textContent = 'Внести закупку';
+    document.getElementById('modalTitle').textContent = existing ? 'Изменить закупку' : 'Внести закупку';
     modalBody.innerHTML = `
       <div id="rowsWrap">${rows.map((r,i)=>`
         <div class="field-row" style="align-items:flex-end;">
@@ -455,19 +511,20 @@ function openPurchaseForm(){
             <input type="number" min="0" class="row-packs" data-idx="${i}" value="${r.packs}">
           </div>
           <div class="field" style="flex:1;">
-            <label>Цена/пач.</label>
-            <input type="number" min="0" class="row-price" data-idx="${i}" value="${r.price}">
+            <label>Закуп/пач.</label>
+            <input type="number" min="0" class="row-cost" data-idx="${i}" value="${r.cost}">
           </div>
           ${rows.length>1?`<button class="row-remove btn btn-outline btn-sm" data-idx="${i}" style="margin-bottom:12px;">✕</button>`:''}
         </div>
+        <div style="font-size:11.5px;color:var(--muted);margin:-6px 0 12px 2px;">продажа: ${money(r.sell)}/пач.</div>
       `).join('')}</div>
       <button id="addRowBtn" class="btn btn-outline btn-sm" style="margin-bottom:14px;">+ Добавить позицию</button>
-      <div class="field"><label>Итого заплачено (считается автоматически, можно поправить)</label><input id="pu-total" type="number" min="0" value="${total}"></div>
+      <div class="field"><label>Итого заплачено (считается автоматически по закупочной цене, можно поправить)</label><input id="pu-total" type="number" min="0" value="${total}"></div>
       <label style="display:flex;align-items:center;gap:8px;font-size:13.5px;margin:2px 0 14px;">
-        <input type="checkbox" id="pu-fromcash" checked style="width:auto;"> Оплачено из кассы (учитывать при подсчёте налички)
+        <input type="checkbox" id="pu-fromcash" ${paidFromCash?'checked':''} style="width:auto;"> Оплачено из кассы (учитывать при подсчёте налички)
       </label>
-      <div class="field"><label>Заметка (необязательно)</label><input id="pu-note" placeholder="напр. довезли с оптовой базы"></div>
-      <button id="pu-save" class="btn btn-primary btn-block">Добавить закупку</button>
+      <div class="field"><label>Заметка (необязательно)</label><input id="pu-note" value="${escapeHtml(noteVal)}" placeholder="напр. довезли с оптовой базы"></div>
+      <button id="pu-save" class="btn btn-primary btn-block">${existing?'Сохранить изменения':'Добавить закупку'}</button>
     `;
     modalOverlay.classList.remove('hidden');
     wire();
@@ -483,17 +540,16 @@ function openPurchaseForm(){
   function wire(){
     modalBody.querySelectorAll('.row-product').forEach(sel=>sel.addEventListener('change', e=>{
       const i = Number(e.target.dataset.idx);
-      rows[i].productId = e.target.value;
       const p = productById(e.target.value);
-      rows[i].price = p ? p.packPrice : 0;
+      rows[i] = defaultsFor(p);
       render();
     }));
     modalBody.querySelectorAll('.row-packs').forEach(inp=>inp.addEventListener('input', e=>{
       rows[Number(e.target.dataset.idx)].packs = e.target.value;
       updateTotalField();
     }));
-    modalBody.querySelectorAll('.row-price').forEach(inp=>inp.addEventListener('input', e=>{
-      rows[Number(e.target.dataset.idx)].price = e.target.value;
+    modalBody.querySelectorAll('.row-cost').forEach(inp=>inp.addEventListener('input', e=>{
+      rows[Number(e.target.dataset.idx)].cost = e.target.value;
       updateTotalField();
     }));
     modalBody.querySelectorAll('.row-remove').forEach(btn=>btn.addEventListener('click', e=>{
@@ -501,17 +557,18 @@ function openPurchaseForm(){
       render();
     }));
     document.getElementById('addRowBtn').addEventListener('click', ()=>{
-      const p = activeProducts()[0];
-      rows.push({ productId: p.id, packs:1, price: p.packPrice||0 });
+      rows.push(defaultsFor(activeProducts()[0]));
       render();
     });
     document.getElementById('pu-total').addEventListener('input', e=>{
       totalEdited = true;
       manualTotal = Number(e.target.value)||0;
     });
+    document.getElementById('pu-fromcash').addEventListener('change', e=>{ paidFromCash = e.target.checked; });
+    document.getElementById('pu-note').addEventListener('input', e=>{ noteVal = e.target.value; });
     document.getElementById('pu-save').addEventListener('click', async ()=>{
       const items = rows.filter(r=>Number(r.packs)>0).map(r=>({
-        productId: r.productId, packs: Number(r.packs)||0, price: Number(r.price)||0
+        productId: r.productId, packs: Number(r.packs)||0, cost: Number(r.cost)||0, sell: Number(r.sell)||0
       }));
       if(!items.length){ alert('Добавь хотя бы одну позицию с количеством пачек'); return; }
       const totalPaid = Number(document.getElementById('pu-total').value)||0;
@@ -519,16 +576,20 @@ function openPurchaseForm(){
         items,
         totalPaid,
         paidFromCash: document.getElementById('pu-fromcash').checked,
-        note: document.getElementById('pu-note').value.trim(),
-        time: firebase.firestore.FieldValue.serverTimestamp()
+        note: document.getElementById('pu-note').value.trim()
       };
-      await db.collection('days').doc(ACTIVE_DAY).collection('purchases').add(entry);
+      if(existing){
+        await db.collection('days').doc(ACTIVE_DAY).collection('purchases').doc(existing.id).update(entry);
+      } else {
+        entry.time = firebase.firestore.FieldValue.serverTimestamp();
+        await db.collection('days').doc(ACTIVE_DAY).collection('purchases').add(entry);
+      }
       closeModal();
       await loadActiveDay();
     });
   }
 
-  openModal('Внести закупку', '');
+  openModal(existing?'Изменить закупку':'Внести закупку', '');
   render();
 }
 
