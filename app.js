@@ -763,7 +763,7 @@ async function clearDay(){
   if(ACTIVE_CONTEXT==='archive'){
     renderArchiveList();
   } else {
-    await loadActiveDay();
+    await loadToday(); // заново определяем актуальный день (сегодня или другой незакрытый), а не остаёмся на удалённой дате
   }
 }
 
